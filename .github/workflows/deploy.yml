@@ -1,0 +1,93 @@
+name: Deploy
+
+# CD is driven from GitHub Actions (Vercel's own git auto-deploy is disabled via
+# vercel.json -> git.deploymentEnabled: false). Production deploys on push to main;
+# every pull request gets a preview deployment whose URL is commented on the PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Avoid piling up deploys for the same ref.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Vercel CLI
+        run: pnpm add -g vercel@latest
+
+      # ── Production (push to main) ──────────────────────────────────────────
+      - name: Deploy production
+        if: github.event_name == 'push'
+        run: |
+          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+          vercel build --prod --token="$VERCEL_TOKEN"
+          url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "Production: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+        id: prod
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      # ── Preview (pull request) ─────────────────────────────────────────────
+      - name: Deploy preview
+        if: github.event_name == 'pull_request'
+        run: |
+          vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
+          vercel build --token="$VERCEL_TOKEN"
+          url=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          echo "Preview: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+        id: preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request' && steps.preview.outputs.url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = "${{ steps.preview.outputs.url }}";
+            const marker = "<!-- vercel-preview -->";
+            const body = `${marker}\n🚀 **Preview deployment:** ${url}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
